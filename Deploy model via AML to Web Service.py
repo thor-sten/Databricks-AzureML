@@ -8,7 +8,7 @@
 
 # MAGIC %md
 # MAGIC 
-# MAGIC In this demo we will train a simple ML model in Databricks and deploy it as web service for live scoring, using MLflow and Azure Machine Learning Studio (AML). We will use the Iris flower dataset and build a support vector classifier with scikit-learn.
+# MAGIC This demo shows how to deploy a ML model trained in Databricks as a web service for real-time scoring. We will use the Iris flower dataset to train a scikit-learn classifier, which we deploy using MLflow and Azure Machine Learning Studio (AML).
 # MAGIC 
 # MAGIC <img src="https://docs.microsoft.com/en-us/azure/machine-learning/media/how-to-deploy-mlflow-models/mlflow-diagram-deploy.png" width="600"/>
 # MAGIC 
@@ -16,7 +16,9 @@
 # MAGIC - [Set up MLflow](https://docs.microsoft.com/en-us/azure/machine-learning/how-to-use-mlflow) to track model parameters, metrics and artifacts, using AML as [remote tracking server](https://www.mlflow.org/docs/latest/tracking.html#scenario-4-mlflow-with-remote-tracking-server-backend-and-artifact-stores)
 # MAGIC - Load the dataset and train the ML model
 # MAGIC - Deploy the model to a [web service via AML and the MLflow API](https://docs.microsoft.com/en-us/azure/machine-learning/how-to-deploy-mlflow-models)
-# MAGIC - Send new data to REST endpoint for [scoring](https://docs.microsoft.com/en-us/azure/machine-learning/how-to-consume-web-service?tabs=python) 
+# MAGIC - Send new data to REST endpoint for [scoring](https://docs.microsoft.com/en-us/azure/machine-learning/how-to-consume-web-service?tabs=python)
+# MAGIC 
+# MAGIC When using this setup all tracking is done in AML studio, note that the experiment will not show up in the Databricks experiment UI.
 
 # COMMAND ----------
 
@@ -42,10 +44,10 @@
 # Connect to or create Azure ML studio workspace
 from azureml.core import Workspace
 
-# Susbscription ID and resource group of the AML workspace 
-subscription_id = '3f2e4d32-8e8d-46d6-82bc-5bb8d962328b'
+# Susbscription ID for the AML workspace (using secret scope instead of clear text)
+subscription_id = dbutils.secrets.get(scope="demo-scope", key="field-eng-subscriptionID")
+# Select existing AML workspace or a new name to create a workspace in the resource group
 resource_group = 'thortest'
-# Select existing AML workspace or a new name to create a workspace 
 workspace_name = 'aml-thorsten'
 
 # Load or create Azure ML workspace
@@ -82,12 +84,12 @@ data_train.head()
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Train ML model
+# MAGIC ## Model training
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ** Create additional info to be logged with ML model (optional)**
+# MAGIC ###Create additional info to be logged with ML model (optional)
 # MAGIC - Pip requirenments file containing the azureml-defaults package, saved on driver node
 # MAGIC - Model signature: Schema of input and output data
 # MAGIC - Input example data
@@ -112,22 +114,24 @@ input_schema = Schema([
 output_schema = Schema([ColSpec("integer")])
 model_signature = ModelSignature(inputs=input_schema, outputs=output_schema)
 
-# Create example data
+# Create example data to log in MLflow
 example_data = data_test.iloc[0:2]
 
 # COMMAND ----------
 
-# Train model and log with mlflow
-from sklearn import svm
-from mlflow.models.signature import infer_signature
+# MAGIC %md
+# MAGIC ###Train model and log with MLflow
+# MAGIC 
+# MAGIC In this example we use MLflow autologging for parameter and metrics logging, but manually define model parameters logging for customization. When using autologging for models, set the autolog parameter *log_model_signatures=False* when getting a MLflow exception during deployment. 
 
-# Log training metrics with MLflow autologging
-# Disable autologging for model artifact and use manual model logging instead
-mlflow.sklearn.autolog(log_model_signatures=False, log_models=False)
+# COMMAND ----------
+
+from sklearn import svm
+mlflow.sklearn.autolog(log_models=False)
 
 artifact_path = 'model' # select folder name for model artifacts
-
 svm_model = svm.SVC()
+
 with mlflow.start_run() as run:
   svm_model.fit(data_train, target_train)
   val_metrics = mlflow.sklearn.eval_and_log_metrics(svm_model, data_test, target_test, prefix="val_")
@@ -145,11 +149,22 @@ print(mlflow.get_run(run_id))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ##Deploy model via Azure ML
+# MAGIC ##Deploy model to Azure Container Instance (ACI)
+# MAGIC 
+# MAGIC Log the model in Azure ML Studio and deploy it to a new container instance with REST endpoint. See the docs on how to [update a deployed web service](https://docs.microsoft.com/en-us/azure/machine-learning/how-to-deploy-update-web-service). 
+# MAGIC 
+# MAGIC ACI is recommended for dev/test deployments and low-scale CPU-based workloads.
 
 # COMMAND ----------
 
-# DBTITLE 1,Register and deploy model
+# Deployment configuration parameters. Don't specify to use default parameters.
+deployment_configs = {
+  "computeType": "aci",
+  "containerResourceRequirements": {"cpu": 1, "memoryInGB": 1}
+}
+
+# COMMAND ----------
+
 from mlflow.deployments import get_deploy_client
 
 # Set the tracking uri as the deployment client
@@ -162,19 +177,19 @@ model_uri = "runs:/{}/{}".format(run_id, artifact_path)
 # mlflow.register_model(model_uri=model_uri, name=model_name)
 
 # This registers and deploys a model with standard configurations
-client.create_deployment(model_uri=model_uri, name=model_name)
+deployment_details = client.create_deployment(model_uri=model_uri, config=deployment_configs, name=model_name)
 
 # COMMAND ----------
 
-# Stop execution in case of "run all" to wait for deployment
+# Stop execution in case of "run all", to wait for deployment
 dbutils.notebook.exit('stop')
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Send request to endpoint
+# MAGIC ## Model scoring - Send request to endpoint
 # MAGIC 
-# MAGIC Once the endpoint is deployed we can send new data to the REST API for scoring. Insert the REST endpoint URL and API key (if activated) below. You can find them under 'Endpoints' in Azure ML studio, toghether with example code for other languages (under 'Consume').
+# MAGIC See examples for other languages [here](https://docs.microsoft.com/en-us/azure/machine-learning/how-to-consume-web-service?tabs=python).
 
 # COMMAND ----------
 
@@ -191,37 +206,31 @@ print(request_data)
 
 # COMMAND ----------
 
-import urllib.request
+import requests
 import json
-import os
-import ssl
 
-def allowSelfSignedHttps(allowed):
-    # bypass the server certificate verification on client side
-    if allowed and not os.environ.get('PYTHONHTTPSVERIFY', '') and getattr(ssl, '_create_unverified_context', None):
-        ssl._create_default_https_context = ssl._create_unverified_context
+# URL for the web service
+scoring_uri = deployment_details['scoringUri']
+# If the service is authenticated, set the key or token
+key = ''
 
-allowSelfSignedHttps(True) # this line is needed if you use self-signed certificate in your scoring service.
-
-# Request data goes here
+# Data to score
 data = request_data
+# Convert to JSON string
+input_data = json.dumps(data)
 
-body = str.encode(json.dumps(data))
+# Set the content type
+headers = {'Content-Type': 'application/json'}
+# If authentication is enabled, set the authorization header
+# headers['Authorization'] = f'Bearer {key}'
 
-url = 'http://20031300-c458-423b-826e-2d767faef75f.northeurope.azurecontainer.io/score'
-api_key = '' # Replace this with the API key for the web service
-headers = {'Content-Type':'application/json', 'Authorization':('Bearer '+ api_key)}
+# Make the request and display the response
+resp = requests.post(scoring_uri, input_data, headers=headers)
+print(resp.text)
 
-req = urllib.request.Request(url, body, headers)
+# COMMAND ----------
 
-try:
-    response = urllib.request.urlopen(req)
-
-    result = response.read()
-    print(result)
-except urllib.error.HTTPError as error:
-    print("The request failed with status code: " + str(error.code))
-
-    # Print the headers - they include the requert ID and the timestamp, which are useful for debugging the failure
-    print(error.info())
-    print(json.loads(error.read().decode("utf8", 'ignore')))
+# MAGIC %md
+# MAGIC Our endpoint is now life and we can send real-time requests to our model for scoring. 
+# MAGIC 
+# MAGIC Don't forget to stop the container instance when it's not needed for cost control!
